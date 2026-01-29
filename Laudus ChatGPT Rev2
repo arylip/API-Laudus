@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+import requests
+import json
+from datetime import datetime, timedelta
+import pandas as pd
+import os
+
+class LaudusExtractor:
+
+    def __init__(self):
+        self.hostAPI = "https://api.laudus.cl"
+        self.token = ""
+        self.session = requests.Session()
+
+    def obtener_token(self, usuario, clave, rut_empresa):
+        url = f"{self.hostAPI}/security/login"
+        payload = {
+            "userName": usuario,
+            "password": clave,
+            "companyVATId": rut_empresa
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        resp = self.session.post(url, json=payload, headers=headers)
+        if resp.status_code == 200:
+            self.token = resp.json()["token"]
+            return True
+        else:
+            print(f"Error autenticación: {resp.status_code} - {resp.text}")
+            return False
+
+    def obtener_ledger(self, fecha_inicio, fecha_fin, limite=1000):
+        url = f"{self.hostAPI}/accounting/ledger"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json"
+        }
+        params = {
+            "dateFrom": fecha_inicio,
+            "dateTo": fecha_fin,
+            "accountNumberFrom": "1",
+            "accountNumberTo": "99999999",
+            "limit": limite,
+            "offset": 0
+        }
+        todos_los_datos = []
+        while True:
+            resp = self.session.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                datos = resp.json()
+                if not datos:
+                    break
+                todos_los_datos.extend(datos)
+                if len(datos) < limite:
+                    break
+                params["offset"] += limite
+            else:
+                print(f"Error obteniendo ledger: {resp.status_code} - {resp.text}")
+                break
+        return todos_los_datos
+
+    def obtener_balance_totales(self, fecha):
+        url = f"{self.hostAPI}/accounting/balanceSheet/totals"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json"
+        }
+        params = {
+            "dateTo": fecha,
+            "limit": 1000,
+            "offset": 0
+        }
+        resp = self.session.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"Error obteniendo balance: {resp.status_code} - {resp.text}")
+            return []
+
+    def procesar_cuentas_balance(self, balances):
+        cuentas_procesadas = []
+        for cuenta in balances:
+            cuentas_procesadas.append({
+                'accountId': cuenta.get('accountId'),
+                'accountNumber': cuenta.get('accountNumber'),
+                'accountName': cuenta.get('accountName'),
+                'debit': cuenta.get('debit', 0),
+                'credit': cuenta.get('credit', 0),
+                'debitBalance': cuenta.get('debitBalance', 0),
+                'creditBalance': cuenta.get('creditBalance', 0)
+            })
+        return cuentas_procesadas
+
+    def exportar_excel_completo(self, ledger_datos, balances_procesados, configuracion):
+        output_file = f"DB_Laudus_{configuracion['periodo']['mes_ano'].replace('/', '_')}.xlsx"
+        writer = pd.ExcelWriter(output_file, engine='openpyxl')
+
+        # Hoja 1: Balances Mensuales
+        datos_balances = []
+        for cuenta in balances_procesados:
+            datos_balances.append({
+                'RUT': configuracion['empresa']['rut'],
+                'Empresa': configuracion['empresa']['nombre'],
+                'accountId': cuenta['accountId'],
+                'accountNumber': cuenta['accountNumber'],
+                'accountName': cuenta['accountName'],
+                'Mes/Año': configuracion['periodo']['mes_ano'],
+                'debit': cuenta['debit'],
+                'credit': cuenta['credit'],
+                'debitBalance Laudus': cuenta['debitBalance'],
+                'creditBalance': cuenta['creditBalance']
+            })
+        df_balances = pd.DataFrame(datos_balances)
+        df_balances.to_excel(writer, sheet_name='Balances Mensuales', index=False)
+
+        # Hoja 2: Plan de Cuentas
+        plan_cuentas = []
+        cuentas_vistas = set()
+        for cuenta in balances_procesados:
+            clave = f"{cuenta['accountNumber']}-{cuenta['accountId']}"
+            if clave not in cuentas_vistas:
+                plan = {
+                    'accountId': cuenta['accountId'],
+                    'accountNumber': cuenta['accountNumber'],
+                    'accountName': cuenta['accountName']
+                }
+                plan_cuentas.append(plan)
+                cuentas_vistas.add(clave)
+        df_plan = pd.DataFrame(plan_cuentas)
+        df_plan.to_excel(writer, sheet_name='Plan de Cuentas', index=False)
+
+        # Hoja 3: Ledger real
+        df_ledger = pd.DataFrame(ledger_datos)
+        df_ledger.to_excel(writer, sheet_name='Ledger', index=False)
+
+        # Hoja 4: TC
+        tc_ejemplo = [
+            {'Fecha': configuracion['periodo']['fecha_corte'], 'currencyCode': 'USD', 'TC': 990.50},
+            {'Fecha': configuracion['periodo']['fecha_corte'], 'currencyCode': 'EUR', 'TC': 1075.80},
+            {'Fecha': configuracion['periodo']['fecha_corte'], 'currencyCode': 'CLP', 'TC': 1.0}
+        ]
+        df_tc = pd.DataFrame(tc_ejemplo)
+        df_tc.to_excel(writer, sheet_name='TC', index=False)
+
+        writer.close()
+        print(f"✅ Excel exportado a {output_file}")
+
+if __name__ == "__main__":
+    extractor = LaudusExtractor()
+    usuario = "administrador"
+    clave = "910"
+    rut = "5.549.071-6"
+
+    periodo_inicio = input("Ingrese el periodo inicial (YYYY-MM): ").strip()
+    periodo_fin = input("Ingrese el periodo final (YYYY-MM): ").strip()
+
+    fecha_inicio = datetime.strptime(periodo_inicio + "-01", "%Y-%m-%d")
+    ultimo_dia = (datetime.strptime(periodo_fin + "-01", "%Y-%m-%d") + timedelta(days=31)).replace(day=1) - timedelta(days=1)
+    fecha_fin = ultimo_dia.strftime("%Y-%m-%d")
+
+    configuracion = {
+        'empresa': {'rut': rut, 'nombre': "Empresa Laudus"},
+        'periodo': {
+            'mes_ano': periodo_inicio.replace("-", "/"),
+            'fecha_corte': fecha_fin,
+            'fecha_inicio': fecha_inicio.strftime("%Y-%m-%d"),
+            'fecha_fin': fecha_fin,
+            'ano_mes': periodo_inicio
+        }
+    }
+
+    if extractor.obtener_token(usuario, clave, rut):
+        balances_raw = extractor.obtener_balance_totales(fecha=fecha_fin)
+        balances_proc = extractor.procesar_cuentas_balance(balances_raw)
+        ledger_datos = extractor.obtener_ledger(configuracion['periodo']['fecha_inicio'], fecha_fin)
+        extractor.exportar_excel_completo(ledger_datos, balances_proc, configuracion)
